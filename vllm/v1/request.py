@@ -108,6 +108,11 @@ class Request:
         # indicates that the output is corrupted
         self.num_nans_in_logits = 0
 
+        self.token_ids_of_cp_sp = None
+        self.num_blocks_of_cp_sp = None
+        self.num_computed_tokens_of_cp_sp = None
+        self.kv_rank = (0, 0)
+
     @classmethod
     def from_engine_core_request(cls, request: EngineCoreRequest) -> "Request":
         if request.mm_kwargs is not None:
