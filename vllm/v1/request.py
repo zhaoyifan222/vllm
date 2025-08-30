@@ -115,16 +115,19 @@ class Request:
         self.num_nans_in_logits = 0
 
         self.block_hashes: list[BlockHash] = []
+        self.block_hashes_cp_sp: list[list[list[BlockHash]]] = []
         self.get_hash_new_full_blocks: Optional[Callable[
             [], list[BlockHash]]] = None
         if block_hasher is not None:
             self.get_hash_new_full_blocks = partial(block_hasher, self)
             self.block_hashes = self.get_hash_new_full_blocks()
 
-        self.token_ids_of_cp_sp = None
-        self.num_blocks_of_cp_sp = None
-        self.num_computed_tokens_of_cp_sp = None
+        self.scheduled_token_ids_cp_sp = None
+        self.num_scheduled_tokens_cp_sp = None
         self.kv_rank = (0, 0)
+        self.num_computed_tokens_cp_sp = None
+        self.computed_token_ids_cp_sp = None
+        self.prev_block_hash_value = None
 
     @classmethod
     def from_engine_core_request(

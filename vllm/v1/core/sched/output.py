@@ -32,7 +32,8 @@ class NewRequestData:
     block_ids: tuple[list[int], ...]
     num_computed_tokens: int
     lora_request: Optional[LoRARequest]
-    num_computed_tokens_of_cp_sp: Optional[list[list[int]]]
+    num_scheduled_tokens_cp_sp: Optional[list[list[int]]]
+    num_computed_tokens_cp_sp: Optional[list[list[int]]]
 
     @classmethod
     def from_request(
@@ -40,6 +41,7 @@ class NewRequestData:
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> NewRequestData:
+        num_computed_tokens_cp_sp=request.num_computed_tokens_cp_sp.copy() if request.num_computed_tokens_cp_sp is not None else None
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -51,7 +53,8 @@ class NewRequestData:
             block_ids=block_ids,
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
-            num_computed_tokens_of_cp_sp=request.num_computed_tokens_of_cp_sp,
+            num_scheduled_tokens_cp_sp=request.num_scheduled_tokens_cp_sp,
+            num_computed_tokens_cp_sp=num_computed_tokens_cp_sp,
         )
 
     def __repr__(self):
@@ -96,7 +99,8 @@ class CachedRequestData:
     new_block_ids: list[Optional[tuple[list[int], ...]]]
     num_computed_tokens: list[int]
     kv_rank: list[tuple[int]]
-    num_computed_tokens_of_cp_sp: list[list[list[int]]]
+    num_scheduled_tokens_cp_sp: list[list[list[int]]]
+    num_computed_tokens_cp_sp: list[list[list[int]]]
 
     @property
     def num_reqs(self) -> int:
@@ -111,7 +115,8 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             kv_rank=[],
-            num_computed_tokens_of_cp_sp=[],
+            num_scheduled_tokens_cp_sp=[],
+            num_computed_tokens_cp_sp=[],
         )
 
 
