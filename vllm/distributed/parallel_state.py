@@ -928,6 +928,24 @@ def get_pp_group() -> GroupCoordinator:
     return _PP
 
 
+_CP: Optional[GroupCoordinator] = None
+
+
+def get_cp_group() -> GroupCoordinator:
+    assert _CP is not None, ("context parallel group is not initialized")
+    return _CP
+
+
+def get_context_model_parallel_world_size():
+    """Return world size for the tensor model parallel group."""
+    return get_cp_group().world_size
+
+
+def get_context_model_parallel_rank():
+    """Return my rank for the tensor model parallel group."""
+    return get_cp_group().rank_in_group
+
+
 @deprecated("`get_pipeline_model_parallel_group` has been replaced with "
             "`get_pp_group` and may be removed in v0.12. Please use "
             "`get_pp_group` instead.")
