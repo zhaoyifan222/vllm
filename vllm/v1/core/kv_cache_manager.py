@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional, overload
+import numpy as np
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
@@ -37,7 +38,24 @@ class KVCacheBlocks:
             tuple(blk1 + blk2
                   for blk1, blk2 in zip(self.blocks, other.blocks)))
 
-    def get_block_ids(self) -> tuple[list[int], ...]:
+    @overload
+    def get_block_ids(
+        self,
+        allow_none: Literal[False] = False,
+    ) -> tuple[list[int], ...]:
+        ...
+
+    @overload
+    def get_block_ids(
+        self,
+        allow_none: Literal[True] = True,
+    ) -> Optional[tuple[list[int], ...]]:
+        ...
+
+    def get_block_ids(
+        self,
+        allow_none: bool = False,
+    ):
         """
         Converts the KVCacheBlocks instance to block_ids.
         
@@ -46,6 +64,8 @@ class KVCacheBlocks:
             * the outer tuple corresponds to KV cache groups
             * each inner list contains the block_ids of the blocks in that group
         """
+        if allow_none and all(len(group) == 0 for group in self.blocks):
+            return None
         return tuple([blk.block_id for blk in group] for group in self.blocks)
 
     def get_unhashed_block_ids(self) -> list[int]:
@@ -61,6 +81,20 @@ class KVCacheBlocks:
         return KVCacheBlocks(tuple([] for _ in range(len(self.blocks))))
 
 
+@dataclass
+class MultiDimKVCacheBlocks:
+    blocks: tuple[list[list[list[KVCacheBlock]]],...]
+    blocks_req: tuple[list[list[list[KVCacheBlock]]],...] = None
+    num_blocks: list[list[int]] = None
+
+    def get_block_ids(
+        self,
+        allow_none: bool = False,
+    ):
+        if allow_none and all([[len(blk_sp_rank)==0 for blk_sp_rank in blk_cp_sp_rank] for blk_cp_sp_rank in group] for group in self.blocks):
+            return None
+        return tuple([[[blk.block_id for blk in blk_sp_rank] for blk_sp_rank in blk_cp_sp_rank] for blk_cp_sp_rank in group] for group in self.blocks)
+
 class KVCacheManager:
 
     def __init__(
@@ -71,6 +105,8 @@ class KVCacheManager:
         use_eagle: bool = False,
         log_stats: bool = False,
         enable_kv_cache_events: bool = False,
+        cp_size: int = 1,
+        sp_size: int = 1,
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -95,6 +131,8 @@ class KVCacheManager:
             use_eagle=self.use_eagle,
             enable_caching=self.enable_caching,
             enable_kv_cache_events=enable_kv_cache_events,
+            cp_size=cp_size,
+            sp_size=sp_size,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -348,10 +386,13 @@ class KVCacheManager:
         """
         return self.block_pool.take_events()
 
+    def get_blocks(self, request_id: str) -> KVCacheBlocks:
+        """Get the blocks of a request."""
+        return KVCacheBlocks(self.coordinator.get_blocks(request_id))
+
     def get_block_ids(self, request_id: str) -> tuple[list[int], ...]:
         """Get the block ids of a request."""
-        return KVCacheBlocks(
-            self.coordinator.get_blocks(request_id)).get_block_ids()
+        return self.get_blocks(request_id).get_block_ids()
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled."""
@@ -362,3 +403,174 @@ class KVCacheManager:
         """Creates a new KVCacheBlocks instance with no blocks."""
         return KVCacheBlocks(tuple([]
                                    for _ in range(self.num_kv_cache_groups)))
+
+
+class MultiDimKVCacheManager(KVCacheManager):
+
+    def __init__(
+        self,
+        kv_cache_config: KVCacheConfig,
+        max_model_len: int,
+        enable_caching: bool = True,
+        use_eagle: bool = False,
+        log_stats: bool = False,
+        enable_kv_cache_events: bool = False,
+        cp_size: int = 1,
+        sp_size: int = 1,
+    ) -> None:
+        super().__init__(kv_cache_config, max_model_len, enable_caching,
+            use_eagle, log_stats, enable_kv_cache_events, cp_size, sp_size)
+        assert cp_size * sp_size > 1
+        self.cp_size = cp_size
+        self.sp_size = sp_size
+
+    def get_computed_blocks(self,
+                            request: Request) -> tuple[KVCacheBlocks, int]:
+        # Prefix caching is disabled or
+        # When the request requires prompt logprobs, we skip prefix caching.
+        request.num_computed_tokens_cp_sp = np.zeros((self.cp_size, self.sp_size), dtype=int)
+        if request.block_hashes_cp_sp == []:
+            request.block_hashes_cp_sp = [[[] for _ in range(self.sp_size)] for _ in range(self.cp_size)]
+        if (not self.enable_caching
+                or (request.sampling_params is not None
+                    and request.sampling_params.prompt_logprobs is not None)):
+            request.computed_token_ids_cp_sp = [[[] for _ in range(self.sp_size)] for _ in range(self.cp_size)]
+            return self.create_empty_block_list(), 0
+
+        # NOTE: When all tokens hit the cache, we must recompute the last token
+        # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
+        # This can trigger recomputation of an entire block, rather than just
+        # the single last token, because allocate_slots() requires
+        # num_computed_tokens to be block-size aligned. Removing this limitation
+        # could slightly improve performance in the future.
+        max_cache_hit_length = request.num_tokens - 1
+        (computed_blocks,
+         num_new_computed_tokens,
+         computed_blocks_cp_sp,
+         request.computed_token_ids_cp_sp,
+         num_blocks_cp_sp) = self.coordinator.find_longest_cache_hit(request.block_hashes, max_cache_hit_length, request.block_hashes_cp_sp)
+        kv_cache_blocks = MultiDimKVCacheBlocks(blocks=computed_blocks_cp_sp, blocks_req=computed_blocks, num_blocks = num_blocks_cp_sp)
+
+        if self.log_stats:
+            assert self.prefix_cache_stats is not None
+            self.prefix_cache_stats.requests += 1
+            self.prefix_cache_stats.queries += request.num_tokens
+            self.prefix_cache_stats.hits += num_new_computed_tokens
+
+        return kv_cache_blocks, num_new_computed_tokens
+
+    def allocate_slots(
+        self,
+        request: Request,
+        num_new_tokens,
+        num_new_computed_tokens,
+        new_computed_blocks: Optional[MultiDimKVCacheBlocks] = None,
+        num_lookahead_tokens: int = 0,
+        delay_cache_blocks: bool = False,
+    ) -> Optional[MultiDimKVCacheBlocks]:
+
+        if np.sum(num_new_tokens) == 0:
+            raise ValueError("num_new_tokens must be greater than 0")
+
+        if new_computed_blocks is not None:
+            new_computed_block_list = new_computed_blocks.blocks
+        else:
+            new_computed_block_list = tuple(
+                [[[] for _ in range(self.sp_size)] for _ in range(self.cp_size)] for _ in range(len(self.kv_cache_config.kv_cache_groups)))
+
+        # Free the blocks that are skipped during the attention computation
+        # (e.g., tokens outside the sliding window).
+        # We can do this even if we cannot schedule this request due to
+        # insufficient free blocks.
+        # Should call this function before allocating new blocks to reduce
+        # the number of evicted blocks.
+        self.coordinator.remove_skipped_blocks(request.request_id,
+                                               request.num_computed_tokens)
+
+        # The number of computed tokens is the number of computed tokens plus
+        # the new prefix caching hits
+        num_computed_tokens = (request.num_computed_tokens_cp_sp +
+                               num_new_computed_tokens)
+        num_tokens_need_slot = np.minimum(
+            num_computed_tokens + num_new_tokens + num_lookahead_tokens,
+            self.max_model_len)
+
+        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=num_tokens_need_slot,
+            new_computed_blocks=new_computed_block_list,
+        )
+
+        for cp_rank in range(self.cp_size):
+            for sp_rank in range(self.sp_size):
+                if num_blocks_to_allocate[cp_rank][sp_rank] > self.block_pool[cp_rank][sp_rank].get_num_free_blocks():
+                    # Cannot allocate new blocks
+                    return None
+
+        # Touch the computed blocks to make sure they won't be evicted.
+        if self.enable_caching:
+            for cp_rank in range(self.cp_size):
+                for sp_rank in range(self.sp_size):
+                    self.block_pool[cp_rank][sp_rank].touch([blocks_per_group[cp_rank][sp_rank] for blocks_per_group in new_computed_block_list])
+        else:
+            for group in new_computed_block_list:
+                for cp_rank in range(self.cp_size):
+                    assert not any(group[cp_rank]), (
+                        "Computed blocks should be empty when "
+                        "prefix caching is disabled")
+
+        # Append the new computed blocks to the request blocks until now to
+        # avoid the case where the new blocks cannot be allocated.
+        self.coordinator.save_new_computed_blocks(request.request_id,
+                                                  new_computed_block_list)
+
+        new_blocks = self.coordinator.allocate_new_blocks(
+            request.request_id, num_tokens_need_slot)
+
+        # P/D: delay caching blocks if we have to recv from
+        # remote. Update state for locally cached blocks.
+        if not self.enable_caching or delay_cache_blocks:
+            return MultiDimKVCacheBlocks(new_blocks)
+
+        # NOTE(woosuk): We want to commit (cache) up to num_computed_tokens +
+        # num_new_tokens, but must exclude "non-committable" tokens (e.g.,
+        # draft tokens that could be rejected). Therefore, we cap the number
+        # at `request.num_tokens`, ensuring only "finalized" tokens are cached.
+        num_tokens_to_cache = np.minimum(num_computed_tokens + num_new_tokens,
+                                  request.num_tokens)
+        self.allocate_new_hashes_to_rank(request, new_computed_blocks)
+        self.coordinator.cache_blocks(request, num_tokens_to_cache)
+
+        return MultiDimKVCacheBlocks(new_blocks)
+
+
+    def allocate_new_hashes_to_rank(self, request: Request, new_computed_blocks) -> None:
+        if new_computed_blocks is None:
+            num_new_computed_blocks_cp_sp = np.zeros((self.cp_size, self.sp_size), dtype=int)
+            start_index = 0
+        else:
+            num_new_computed_blocks_cp_sp = new_computed_blocks.num_blocks
+            start_index = np.sum(num_new_computed_blocks_cp_sp)
+
+        block_hashes = request.block_hashes
+        block_hashes_multidim = request.block_hashes_cp_sp
+
+        for cp_rank in range(self.cp_size):
+            for sp_rank in range(self.sp_size):
+                block_hashes_multidim[cp_rank][sp_rank].extend(block_hashes[start_index: start_index+num_new_computed_blocks_cp_sp[cp_rank][sp_rank]])
+                start_index += num_new_computed_blocks_cp_sp[cp_rank][sp_rank]
+
+    def take_events(self) -> list[KVCacheEvent]:
+        return self.block_pool[0][0].take_events()
+
+    def get_blocks(self, request_id: str) -> MultiDimKVCacheBlocks:
+        return MultiDimKVCacheBlocks(self.coordinator.get_blocks(request_id))
+
+    def create_empty_block_list(self) -> MultiDimKVCacheBlocks:
+
+        blocks = tuple([[[] for _ in range(self.sp_size)] for _ in range(self.cp_size)]
+                                for _ in range(self.num_kv_cache_groups))
+        blocks_req = tuple([] for _ in range(self.num_kv_cache_groups))
+        num_blocks = np.zeros((self.cp_size, self.sp_size), dtype=int)
+
+        return MultiDimKVCacheBlocks(blocks=blocks, blocks_req=blocks_req, num_blocks=num_blocks)

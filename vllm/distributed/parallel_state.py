@@ -953,6 +953,32 @@ def get_pipeline_model_parallel_group():
     return get_pp_group()
 
 
+_CP: Optional[GroupCoordinator] = None
+
+
+def get_cp_group() -> GroupCoordinator:
+    assert _CP is not None, ("context parallel group is not initialized")
+    return _CP
+
+
+def get_context_model_parallel_world_size():
+    """Return world size for the tensor model parallel group."""
+    return get_cp_group().world_size
+
+
+def get_context_model_parallel_rank():
+    """Return my rank for the tensor model parallel group."""
+    return get_cp_group().rank_in_group
+
+
+_CPSP: Optional[GroupCoordinator] = None
+
+
+def get_cpsp_group() -> GroupCoordinator:
+    assert _CPSP is not None, ("context sequence parallel group is not initialized")
+    return _CPSP
+
+
 @contextmanager
 def graph_capture(device: torch.device):
     """
@@ -1160,6 +1186,16 @@ def initialize_model_parallel(
                                     backend,
                                     group_name="cp")
 
+    global _CPSP
+    assert _CPSP is None, ("context parallel group is already initialized")
+    group_ranks = all_ranks.reshape(
+        -1, context_model_parallel_size * tensor_model_parallel_size).unbind(0)
+    group_ranks = [x.tolist() for x in group_ranks]
+    _CPSP = init_model_parallel_group(group_ranks,
+                                    get_world_group().local_rank,
+                                    backend,
+                                    group_name="cp")
+
     logger.info(
         "rank %s in world size %s is assigned as "
         "DP rank %s, PP rank %s, TP rank %s, EP rank %s, CP rank %s", rank, world_size,
@@ -1295,6 +1331,11 @@ def destroy_model_parallel():
     if _CP:
         _CP.destroy()
     _CP = None
+
+    global _CPSP
+    if _CPSP:
+        _CPSP.destroy()
+    _CPSP = None
 
 
 def destroy_distributed_environment():
