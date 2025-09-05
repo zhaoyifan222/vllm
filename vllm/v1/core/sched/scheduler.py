@@ -19,7 +19,7 @@ from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
                                                 compute_encoder_budget)
-from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager, MultiDimKVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
                                        SchedulerOutput)
@@ -149,15 +149,31 @@ class Scheduler(SchedulerInterface):
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
 
+        self.cp_size = vllm_config.parallel_config.context_parallel_size
+        self.enable_sp = vllm_config.parallel_config.enable_sequence_parallel
+        self.sp_size = vllm_config.parallel_config.tensor_parallel_size if self.enable_sp else 1
+        self.cp_sp_size = self.cp_size * self.sp_size
         # Create the KV cache manager.
-        self.kv_cache_manager = KVCacheManager(
-            kv_cache_config=kv_cache_config,
-            max_model_len=self.max_model_len,
-            enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
-            log_stats=self.log_stats,
-            enable_kv_cache_events=self.enable_kv_cache_events,
-        )
+        if self.cp_sp_size > 1:
+            self.kv_cache_manager = MultiDimKVCacheManager(
+                kv_cache_config=kv_cache_config,
+                max_model_len=self.max_model_len,
+                enable_caching=self.cache_config.enable_prefix_caching,
+                use_eagle=self.use_eagle,
+                log_stats=self.log_stats,
+                enable_kv_cache_events=self.enable_kv_cache_events,
+                cp_size=self.cp_size,
+                sp_size=self.sp_size,
+            )
+        else:
+            self.kv_cache_manager = KVCacheManager(
+                kv_cache_config=kv_cache_config,
+                max_model_len=self.max_model_len,
+                enable_caching=self.cache_config.enable_prefix_caching,
+                use_eagle=self.use_eagle,
+                log_stats=self.log_stats,
+                enable_kv_cache_events=self.enable_kv_cache_events,
+            )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
     def schedule(self) -> SchedulerOutput:
@@ -637,7 +653,8 @@ class Scheduler(SchedulerInterface):
 
         # cp param
         kv_rank: list[tuple[int]] = []
-        num_computed_tokens_of_cp_sp: list[list[list[int]]] = []
+        num_scheduled_tokens_cp_sp: list[list[list[int]]] = []
+        num_computed_tokens_cp_sp: list[list[list[int]]] = []
 
         use_connector = self.connector is not None
         for req in itertools.chain(running_reqs, resumed_reqs):
@@ -662,7 +679,8 @@ class Scheduler(SchedulerInterface):
             new_block_ids.append(req_to_new_block_ids[req_id])
             num_computed_tokens.append(req.num_computed_tokens)
             kv_rank.append(req.kv_rank)
-            num_computed_tokens_of_cp_sp.append(req.num_computed_tokens_of_cp_sp)
+            num_scheduled_tokens_cp_sp.append(req.num_scheduled_tokens_cp_sp)
+            num_computed_tokens_cp_sp.append(req.num_computed_tokens_cp_sp.copy() if req.num_computed_tokens_cp_sp is not None else None)
         # Because resumed_reqs is usually empty, it is more efficient to do
         # in-place appending so that we don't need to allocate a new list.
         resumed_from_preemption = [False] * len(running_reqs)
@@ -675,7 +693,8 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             kv_rank=kv_rank,
-            num_computed_tokens_of_cp_sp=num_computed_tokens_of_cp_sp,
+            num_scheduled_tokens_cp_sp=num_scheduled_tokens_cp_sp,
+            num_computed_tokens_cp_sp=num_computed_tokens_cp_sp,
         )
 
     def _try_schedule_encoder_inputs(

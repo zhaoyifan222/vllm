@@ -3,6 +3,7 @@
 import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
+import numpy as np
 
 from vllm.utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
@@ -24,6 +25,8 @@ class SingleTypeKVCacheManager(ABC):
         kv_cache_spec: KVCacheSpec,
         block_pool: BlockPool,
         kv_cache_group_id: int,
+        cp_size,
+        sp_size,
     ) -> None:
         """
         Initializes the SingleTypeKVCacheManager.
@@ -50,7 +53,13 @@ class SingleTypeKVCacheManager(ABC):
         self.num_cached_block: dict[str, int] = {}
 
         self.kv_cache_group_id = kv_cache_group_id
-        self._null_block = block_pool.null_block
+        self.cp_size = cp_size
+        self.sp_size = sp_size
+        if self.cp_size * sp_size > 1:
+            self.num_cached_block_cp_sp: dict[str, list[list[int]]] = {}
+            self._null_block = block_pool[0][0].null_block
+        else:
+            self._null_block = block_pool.null_block
 
     def get_num_blocks_to_allocate(
             self, request_id: str, num_tokens: int,
@@ -289,6 +298,171 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                 num_common_blocks += 1
             else:
                 break
+        return num_common_blocks
+
+
+class MultiDimFullAttentionManager(SingleTypeKVCacheManager):
+
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: list[BlockHash],
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: list[list[BlockPool]],
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        block_hashes_cp_sp: list[list[list[BlockHash]]],
+    ) -> tuple[list[KVCacheBlock], ...]:
+        assert isinstance(
+            kv_cache_spec, (FullAttentionSpec, ChunkedLocalAttentionSpec)
+        ), "FullAttentionManager can only be used for full attention " \
+            "and chunked local attention groups"
+        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            [] for _ in range(len(kv_cache_group_ids)))
+        computed_blocks_cp_sp: tuple[list[list[KVCacheBlock]], ...] = tuple(
+            [[[] for _ in range(cls.sp_size)] for _ in range(cls.cp_size)] for _ in range(len(kv_cache_group_ids)))
+        computed_token_ids_cp_sp: list[list[int]] = [[[] for _ in range(cls.sp_size)] for _ in range(cls.cp_size)]
+        num_blocks_cp_sp = np.zeros((cls.cp_size, cls.sp_size), dtype=int)
+        
+        max_num_blocks = max_length // kv_cache_spec.block_size
+        for i, block_hash in zip(range(max_num_blocks), block_hashes):
+            # block_hashes is a chain of block hashes. If a block hash is not
+            # in the cached_block_hash_to_id, the following block hashes are
+            # not computed yet for sure.
+            cached_block = None
+            for cp_rank in range(cls.cp_size):
+                for sp_rank in range(cls.sp_size):  
+                    if cached_block := block_pool[cp_rank][sp_rank].get_cached_block(block_hash, kv_cache_group_ids):
+                        for computed, cached in zip(computed_blocks, cached_block):
+                            computed.append(cached)
+                        for computed, cached in zip(computed_blocks_cp_sp, cached_block):
+                            computed[cp_rank][sp_rank].append(cached)
+                        block_hashes_cp_sp[cp_rank][sp_rank].append(block_hash)
+                        computed_token_ids_cp_sp[cp_rank][sp_rank].extend(block_hash.token_ids)
+                        break
+                if cached_block is not None:
+                    break
+            
+            if cached_block is None:
+                break
+        
+        for cp_rank in range(cls.cp_size):
+            for sp_rank in range(cls.sp_size):  
+                num_blocks_cp_sp[cp_rank][sp_rank] = len(computed_blocks_cp_sp[0][cp_rank][sp_rank])
+
+        if use_eagle and computed_blocks[0]:
+            for computed in computed_blocks:
+                computed.pop()
+        return computed_blocks, computed_blocks_cp_sp, computed_token_ids_cp_sp, num_blocks_cp_sp
+
+    def get_num_blocks_to_allocate(
+            self, request_id: str, num_tokens: int,
+            new_computed_blocks: list[KVCacheBlock]) -> int:
+
+        if self.req_to_blocks[request_id] == []:
+            self.req_to_blocks[request_id] = [[[] for _ in range(self.sp_size)] for _ in range(self.cp_size)]
+
+        num_blocks_need_allocated = np.zeros((self.cp_size, self.sp_size), dtype=int)
+        for cp_rank in range(self.cp_size):
+            for sp_rank in range(self.sp_size):
+                num_required_blocks = cdiv(num_tokens[cp_rank][sp_rank], self.block_size)
+                num_new_blocks = (num_required_blocks - len(new_computed_blocks[cp_rank][sp_rank]) -
+                                len(self.req_to_blocks[request_id][cp_rank][sp_rank]))
+                # If a computed block of a request is an eviction candidate (in the
+                # free queue and ref_cnt == 0), it will be changed from a free block
+                # to a computed block when the request is allocated, so we also count
+                # it as needed to be allocated.
+                num_evictable_computed_blocks = sum(
+                    blk.ref_cnt == 0 and not blk.is_null
+                    for blk in new_computed_blocks[cp_rank][sp_rank])
+                num_blocks_need_allocated[cp_rank][sp_rank] = num_new_blocks + num_evictable_computed_blocks
+        return num_blocks_need_allocated
+
+    def save_new_computed_blocks(
+            self, request_id: str,
+            new_computed_blocks: list[KVCacheBlock]) -> None:
+
+        if request_id not in self.num_cached_block:
+            # A new request.
+            req_blocks = self.req_to_blocks[request_id]
+            self.num_cached_block_cp_sp[request_id] = np.zeros((self.cp_size, self.sp_size), dtype=int)
+            for cp_rank in range(self.cp_size):
+                for sp_rank in range(self.sp_size):
+                    assert len(req_blocks[cp_rank][sp_rank]) == 0
+                    req_blocks[cp_rank][sp_rank].extend(new_computed_blocks[cp_rank][sp_rank])
+
+                    self.num_cached_block_cp_sp[request_id][cp_rank][sp_rank] = len(new_computed_blocks[cp_rank][sp_rank])
+            self.num_cached_block[request_id] = np.sum(self.num_cached_block_cp_sp[request_id])
+        else:
+            for cp_rank in range(self.cp_size):
+                for sp_rank in range(self.sp_size):
+                    # A running request. Should not have new computed blocks.
+                    assert len(new_computed_blocks[cp_rank][sp_rank]) == 0
+
+    def allocate_new_blocks(self, request_id: str,
+                            num_tokens: int) -> list[KVCacheBlock]:
+
+        req_blocks = self.req_to_blocks[request_id]
+        new_blocks_cp_sp = [[[] for _ in range(self.sp_size)] for _ in range(self.cp_size)]
+        for cp_rank in range(self.cp_size):
+            for sp_rank in range(self.sp_size):
+                num_required_blocks = cdiv(num_tokens[cp_rank][sp_rank], self.block_size)
+                num_new_blocks = num_required_blocks - len(req_blocks[cp_rank][sp_rank])
+                if num_new_blocks > 0:
+                    new_blocks = self.block_pool[cp_rank][sp_rank].get_new_blocks(num_new_blocks)
+                    req_blocks[cp_rank][sp_rank].extend(new_blocks)
+                    new_blocks_cp_sp[cp_rank][sp_rank] = new_blocks
+        return new_blocks_cp_sp
+
+    def cache_blocks(self, request: Request, num_tokens: int) -> None:
+
+        num_full_blocks_cp_sp = num_tokens // self.block_size
+        for cp_rank in range(self.cp_size):
+            for sp_rank in range(self.sp_size):
+                num_full_blocks = num_full_blocks_cp_sp[cp_rank][sp_rank]
+                self.block_pool[cp_rank][sp_rank].cache_full_blocks(
+                    request=request,
+                    blocks=self.req_to_blocks[request.request_id][cp_rank][sp_rank],
+                    num_cached_blocks=self.num_cached_block_cp_sp[request.request_id][cp_rank][sp_rank],
+                    num_full_blocks=num_full_blocks,
+                    block_size=self.block_size,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                )
+                self.num_cached_block_cp_sp[request.request_id][cp_rank][sp_rank] = num_full_blocks
+        self.num_cached_block[request.request_id] = np.sum(self.num_cached_block_cp_sp[request.request_id])
+
+    def free(self, request_id: str) -> None:
+        # Default to [] in case a request is freed (aborted) before alloc.
+        req_blocks = self.req_to_blocks.pop(request_id, [[[] for _ in range(self.sp_size)] for _ in range(self.cp_size)])
+
+        # Free blocks in reverse order so that the tail blocks are
+        # freed first.
+        for cp_rank in range(self.cp_size):
+            for sp_rank in range(self.sp_size):
+                ordered_blocks = reversed(req_blocks[cp_rank][sp_rank])
+                self.block_pool[cp_rank][sp_rank].free_blocks(ordered_blocks)
+
+        self.num_cached_block.pop(request_id, None)
+        self.num_cached_block_cp_sp.pop(request_id, None)
+
+
+    def remove_skipped_blocks(self, request_id: str,
+                              num_computed_tokens: int) -> None:
+        # No need to remove blocks for full attention.
+        pass
+
+    def get_num_common_prefix_blocks(self, request_id: str,
+                                     num_running_requests: int) -> int:
+        blocks = self.req_to_blocks[request_id]
+
+        num_common_blocks = np.zeros((self.cp_size, self.sp_size), dtype=int)
+        for cp_rank in range(self.cp_size):
+            for sp_rank in range(self.sp_size):
+                for block in blocks[cp_rank][sp_rank]:
+                    if block.ref_cnt == num_running_requests:
+                        num_common_blocks[cp_rank][sp_rank] += 1
+                    else:
+                        break
         return num_common_blocks
 
 
@@ -560,8 +734,11 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
 }
 
 
-def get_manager_for_kv_cache_spec(kv_cache_spec: KVCacheSpec,
+def get_manager_for_kv_cache_spec(kv_cache_spec: KVCacheSpec, cp_size=1, sp_size=1,
                                   **kwargs) -> SingleTypeKVCacheManager:
     manager_class = spec_manager_map[type(kv_cache_spec)]
-    manager = manager_class(kv_cache_spec, **kwargs)
+    if cp_size * sp_size > 1:
+        # add MultiDimFullAttentionManager to spec_manager_map
+        manager_class = MultiDimFullAttentionManager
+    manager = manager_class(kv_cache_spec, cp_size=cp_size, sp_size=sp_size, **kwargs)
     return manager

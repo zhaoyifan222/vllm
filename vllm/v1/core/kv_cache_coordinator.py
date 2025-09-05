@@ -24,19 +24,27 @@ class KVCacheCoordinator(ABC):
         use_eagle: bool,
         enable_caching: bool,
         enable_kv_cache_events: bool,
+        cp_size: int = 1,
+        sp_size: int = 1,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
-        self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
-                                    enable_kv_cache_events)
+        if cp_size * sp_size > 1:
+            self.block_pool = [[BlockPool(kv_cache_config.num_blocks, enable_caching,
+                                        enable_kv_cache_events) for _ in range(sp_size)] for _ in range(cp_size)]
+        else:
+            self.block_pool = BlockPool(kv_cache_config.num_blocks, enable_caching,
+                                        enable_kv_cache_events)
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
+                cp_size=cp_size,
+                sp_size=sp_size,
                 block_pool=self.block_pool,
                 kv_cache_group_id=i,
             ) for i, kv_cache_group in enumerate(
@@ -180,9 +188,9 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
     """
 
     def __init__(self, kv_cache_config: KVCacheConfig, max_model_len: int,
-                 use_eagle: bool, enable_kv_cache_events: bool):
+                 use_eagle: bool, enable_kv_cache_events: bool, cp_size: int=1, sp_size: int=1):
         super().__init__(kv_cache_config, max_model_len, use_eagle, False,
-                         enable_kv_cache_events)
+                         enable_kv_cache_events, cp_size, sp_size)
         self.num_single_type_manager = len(self.single_type_managers)
 
     def get_num_common_prefix_blocks(self, request_id: str,
@@ -208,9 +216,9 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
 
     def __init__(self, kv_cache_config: KVCacheConfig, max_model_len: int,
                  use_eagle: bool, enable_caching: bool,
-                 enable_kv_cache_events: bool):
+                 enable_kv_cache_events: bool, cp_size: int=1, sp_size: int=1):
         super().__init__(kv_cache_config, max_model_len, use_eagle,
-                         enable_caching, enable_kv_cache_events)
+                         enable_caching, enable_kv_cache_events, cp_size, sp_size)
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[
             0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -231,6 +239,25 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             use_eagle=self.use_eagle,
         )
         return hit_blocks, len(hit_blocks[0]) * self.block_size
+
+class MultiDimUnitaryKVCacheCoordinator(UnitaryKVCacheCoordinator):
+
+    def find_longest_cache_hit(
+        self,
+        block_hashes,
+        max_cache_hit_length: int,
+        block_hashes_cp_sp,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        hit_blocks, hit_blocks_cp_sp, computed_token_ids_cp_sp, num_blocks_cp_sp = self.single_type_managers[0].find_longest_cache_hit(
+            block_hashes=block_hashes,
+            max_length=max_cache_hit_length,
+            kv_cache_group_ids=[0],
+            block_pool=self.block_pool,
+            kv_cache_spec=self.kv_cache_spec,
+            use_eagle=self.use_eagle,
+            block_hashes_cp_sp=block_hashes_cp_sp,
+        )
+        return hit_blocks, len(hit_blocks[0]) * self.block_size, hit_blocks_cp_sp, computed_token_ids_cp_sp, num_blocks_cp_sp
 
 
 class HybridKVCacheCoordinator(KVCacheCoordinator):
@@ -379,13 +406,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
 def get_kv_cache_coordinator(
         kv_cache_config: KVCacheConfig, max_model_len: int, use_eagle: bool,
-        enable_caching: bool,
-        enable_kv_cache_events: bool) -> KVCacheCoordinator:
+        enable_caching: bool, enable_kv_cache_events: bool,
+        cp_size: int, sp_size: int) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(kv_cache_config, max_model_len,
                                                use_eagle,
-                                               enable_kv_cache_events)
+                                               enable_kv_cache_events,
+                                               cp_size,
+                                               sp_size)
     if len(kv_cache_config.kv_cache_groups) == 1:
+        if cp_size * sp_size > 1:
+            return MultiDimUnitaryKVCacheCoordinator(kv_cache_config, max_model_len,
+                                         use_eagle, enable_caching,
+                                         enable_kv_cache_events,
+                                         cp_size,
+                                         sp_size)
         return UnitaryKVCacheCoordinator(kv_cache_config, max_model_len,
                                          use_eagle, enable_caching,
                                          enable_kv_cache_events)
